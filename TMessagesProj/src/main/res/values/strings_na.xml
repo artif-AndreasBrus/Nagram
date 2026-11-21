@@ -412,4 +412,6 @@
     <string name="StickerShapeRounded">Rounded</string>
     <string name="StickerShapeRoundedMsg">Message</string>
     <string name="ActionBar">Action Bar</string>
+    <string name="CarPinnedChats">Pinned</string>
+    <string name="CarNoPinnedChats">Pin chats or bots in Telegram to reach them here.</string>
 </resources>

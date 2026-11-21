@@ -411,4 +411,6 @@
     <string name="StickerShapeRounded">Abgerundet</string>
     <string name="StickerShapeRoundedMsg">Nachricht</string>
     <string name="ActionBar">Aktionsleiste</string>
+    <string name="CarPinnedChats">Angepinnt</string>
+    <string name="CarNoPinnedChats">Pinne Chats oder Bots in Telegram an, um sie hier zu erreichen.</string>
 </resources>

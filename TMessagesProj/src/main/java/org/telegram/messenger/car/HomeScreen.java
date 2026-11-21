@@ -15,6 +15,7 @@ import android.text.TextUtils;
 import androidx.annotation.NonNull;
 import androidx.car.app.CarContext;
 import androidx.car.app.HostInfo;
+import androidx.car.app.constraints.ConstraintManager;
 import androidx.car.app.Screen;
 import androidx.car.app.model.Action;
 import androidx.car.app.model.CarIcon;
@@ -67,9 +68,12 @@ public class HomeScreen extends Screen
         implements DefaultLifecycleObserver, NotificationCenter.NotificationCenterDelegate {
 
     private static final String TAB_NOTIFICATIONS = "tab_notifications";
+    private static final String TAB_PINNED = "tab_pinned";
     private static final String TAB_MUSIC = "tab_music";
 
     private static final int MAX_CONVERSATIONS = 6;
+    /** Upper bound for the pinned tab; the host's own list limit applies on top. */
+    private static final int MAX_PINNED = 20;
     private static final int MAX_MESSAGES_PER_CONV = 5;
     private static final int MAX_MUSIC_DIALOGS = 50;
 
@@ -88,6 +92,7 @@ public class HomeScreen extends Screen
 
     private String activeTabId = TAB_NOTIFICATIONS;
     private boolean musicLoadKicked;
+    private boolean pinnedLoadKicked;
 
     public HomeScreen(@NonNull CarContext carContext) {
         super(carContext);
@@ -104,6 +109,7 @@ public class HomeScreen extends Screen
         // fileLoaded is posted per account, not globally, so it has to be observed on the
         // current account's center and moved whenever that account changes.
         NotificationCenter.getInstance(currentAccount).addObserver(this, NotificationCenter.fileLoaded);
+        NotificationCenter.getInstance(currentAccount).addObserver(this, NotificationCenter.dialogsNeedReload);
     }
 
     @Override
@@ -112,6 +118,7 @@ public class HomeScreen extends Screen
         NotificationCenter.getGlobalInstance().removeObserver(this, NotificationCenter.notificationsCountUpdated);
         NotificationCenter.getGlobalInstance().removeObserver(this, NotificationCenter.activeAccountChanged);
         NotificationCenter.getInstance(currentAccount).removeObserver(this, NotificationCenter.fileLoaded);
+        NotificationCenter.getInstance(currentAccount).removeObserver(this, NotificationCenter.dialogsNeedReload);
     }
 
     @Override
@@ -125,13 +132,16 @@ public class HomeScreen extends Screen
             // Unsubscribe from the outgoing account before currentAccount moves, or the
             // observer would be left registered on it forever.
             NotificationCenter.getInstance(currentAccount).removeObserver(this, NotificationCenter.fileLoaded);
+            NotificationCenter.getInstance(currentAccount).removeObserver(this, NotificationCenter.dialogsNeedReload);
             // Drop grants before switching: they point at the outgoing account's files, and
             // the incoming account must not inherit read access to them.
             revokeHostGrants();
             currentAccount = UserConfig.selectedAccount;
             NotificationCenter.getInstance(currentAccount).addObserver(this, NotificationCenter.fileLoaded);
+            NotificationCenter.getInstance(currentAccount).addObserver(this, NotificationCenter.dialogsNeedReload);
             pendingVoiceLoads.clear();
             musicLoadKicked = false;
+            pinnedLoadKicked = false;
             invalidate();
         } else if (id == NotificationCenter.fileLoaded) {
             if (args.length > 0 && args[0] instanceof String
@@ -141,7 +151,9 @@ public class HomeScreen extends Screen
                 invalidate();
             }
         } else if ((id == NotificationCenter.pushMessagesUpdated || id == NotificationCenter.notificationsCountUpdated)
-                && TAB_NOTIFICATIONS.equals(activeTabId)) {
+                && (TAB_NOTIFICATIONS.equals(activeTabId) || TAB_PINNED.equals(activeTabId))) {
+            invalidate();
+        } else if (id == NotificationCenter.dialogsNeedReload && TAB_PINNED.equals(activeTabId)) {
             invalidate();
         }
     }
@@ -164,6 +176,11 @@ public class HomeScreen extends Screen
                 .setTitle(LocaleController.getString(R.string.Notifications))
                 .build());
         builder.addTab(new Tab.Builder()
+                .setContentId(TAB_PINNED)
+                .setIcon(iconResource(R.drawable.msg_pin))
+                .setTitle(LocaleController.getString(R.string.CarPinnedChats))
+                .build());
+        builder.addTab(new Tab.Builder()
                 .setContentId(TAB_MUSIC)
                 .setIcon(iconResource(R.drawable.filled_widget_music))
                 .setTitle(LocaleController.getString(R.string.Music))
@@ -178,6 +195,8 @@ public class HomeScreen extends Screen
         switch (tabId) {
             case TAB_MUSIC:
                 return buildMusicTemplate();
+            case TAB_PINNED:
+                return buildPinnedTemplate();
             case TAB_NOTIFICATIONS:
             default:
                 return buildNotificationsTemplate();
@@ -196,7 +215,7 @@ public class HomeScreen extends Screen
         int count = 0;
         for (Map.Entry<Long, ArrayList<MessageObject>> entry : grouped.entrySet()) {
             if (count++ >= MAX_CONVERSATIONS) break;
-            ConversationItem item = buildConversationItem(entry.getKey(), entry.getValue());
+            ConversationItem item = buildConversationItem(entry.getKey(), entry.getValue(), false);
             if (item != null) list.addItem(item);
         }
         return new ListTemplate.Builder()
@@ -225,7 +244,7 @@ public class HomeScreen extends Screen
         return grouped;
     }
 
-    private ConversationItem buildConversationItem(long dialogId, ArrayList<MessageObject> messages) {
+    ConversationItem buildConversationItem(long dialogId, ArrayList<MessageObject> messages, boolean read) {
         if (messages.isEmpty()) return null;
         Collections.reverse(messages);
         AccountInstance ai = AccountInstance.getInstance(currentAccount);
@@ -249,7 +268,9 @@ public class HomeScreen extends Screen
         Person.Builder convPersonBuilder = new Person.Builder()
                 .setName(title)
                 .setKey(String.valueOf(dialogId));
-        IconCompat icon = loadAvatarIcon(user, chat);
+        // Without an icon the host draws the initial of the latest sender, which is
+        // "You" whenever the last message is outgoing; hence the letter avatar fallback.
+        IconCompat icon = avatarFor(user, chat);
         if (icon != null) convPersonBuilder.setIcon(icon);
 
         TLRPC.User self = UserConfig.getInstance(currentAccount).getCurrentUser();
@@ -266,7 +287,7 @@ public class HomeScreen extends Screen
         int start = Math.max(0, messages.size() - MAX_MESSAGES_PER_CONV);
         for (int i = start; i < messages.size(); i++) {
             MessageObject mo = messages.get(i);
-            CarMessage cm = buildCarMessage(mo, dialogId, isGroup, user, chat);
+            CarMessage cm = buildCarMessage(mo, dialogId, isGroup, user, chat, read, selfPerson);
             if (cm != null) carMessages.add(cm);
         }
         if (carMessages.isEmpty()) return null;
@@ -286,7 +307,7 @@ public class HomeScreen extends Screen
         return cb.build();
     }
 
-    private CarMessage buildCarMessage(MessageObject mo, long dialogId, boolean isGroup, TLRPC.User user, TLRPC.Chat chat) {
+    CarMessage buildCarMessage(MessageObject mo, long dialogId, boolean isGroup, TLRPC.User user, TLRPC.Chat chat, boolean read, Person selfPerson) {
         String[] senderName = new String[1];
         boolean[] preview = new boolean[1];
         String body;
@@ -313,8 +334,10 @@ public class HomeScreen extends Screen
         CarMessage.Builder builder = new CarMessage.Builder()
                 .setBody(CarText.create(body))
                 .setReceivedTimeEpochMillis(((long) mo.messageOwner.date) * 1000L)
-                .setSender(senderBuilder.build())
-                .setRead(false);
+                // Outgoing messages must carry the same Person as setSelf(), so the host
+                // presents them as "you" instead of attributing them to the chat partner.
+                .setSender(mo.isOut() ? selfPerson : senderBuilder.build())
+                .setRead(read);
 
         attachVoiceNote(builder, mo, preview[0]);
 
@@ -419,6 +442,161 @@ public class HomeScreen extends Screen
         grantedUris.clear();
     }
 
+    // ===== Pinned tab =====
+
+    /**
+     * The chats and bots pinned in the main chat list, so frequent contacts and bot
+     * integrations (Home Assistant and the like) can be reached by voice reply without
+     * waiting for them to write first. Only the latest message is shown, and it counts as
+     * read unless the chat has unread messages, so the host does not read it out again.
+     */
+    private Template buildPinnedTemplate() {
+        MessagesController mc = MessagesController.getInstance(currentAccount);
+        // getDialogs(0) is only filled once the chat list UI has sorted it, which never
+        // happens when the car starts the process. allDialogs is populated by the load itself.
+        ArrayList<TLRPC.Dialog> all = mc.getAllDialogs();
+        if (!pinnedLoadKicked && mc.getDialogs(0).isEmpty()) {
+            // The chat list was never opened in this process, so allDialogs may only hold the
+            // few chats push updates touched. Load it from the local cache once;
+            // dialogsNeedReload rebuilds the tab when it lands.
+            pinnedLoadKicked = true;
+            mc.loadDialogs(0, 0, 50, true);
+            if (all.isEmpty()) {
+                return new ListTemplate.Builder().setLoading(true).build();
+            }
+        }
+        ArrayList<TLRPC.Dialog> pinned = new ArrayList<>();
+        for (TLRPC.Dialog dialog : all) {
+            if (dialog == null || !dialog.pinned || dialog.folder_id != 0) continue;
+            if (dialog instanceof TLRPC.TL_dialogFolder || DialogObject.isFolderDialogId(dialog.id)) continue;
+            if (DialogObject.isEncryptedDialog(dialog.id)) continue;
+            pinned.add(dialog);
+        }
+        // Same order as the chat list: higher pinnedNum is further up.
+        Collections.sort(pinned, (a, b) -> Integer.compare(b.pinnedNum, a.pinnedNum));
+
+        int limit = Math.min(MAX_PINNED, hostListLimit());
+        ItemList.Builder list = new ItemList.Builder();
+        int added = 0;
+        for (int i = 0; i < pinned.size() && added < limit; i++) {
+            TLRPC.Dialog dialog = pinned.get(i);
+            Row row = buildPinnedRow(mc, dialog);
+            if (row != null) {
+                list.addItem(row);
+                added++;
+            }
+        }
+        if (added == 0) {
+            return new MessageTemplate.Builder(LocaleController.getString(R.string.CarNoPinnedChats))
+                    .build();
+        }
+        return new ListTemplate.Builder()
+                .setSingleList(list.build())
+                .build();
+    }
+
+    /** One chat in the pinned list: avatar, name, unread count or time, latest message. */
+    private Row buildPinnedRow(MessagesController mc, TLRPC.Dialog dialog) {
+        long dialogId = dialog.id;
+        TLRPC.User user = null;
+        TLRPC.Chat chat = null;
+        String title;
+        if (DialogObject.isUserDialog(dialogId)) {
+            user = mc.getUser(dialogId);
+            if (user == null) return null;
+            title = UserObject.isUserSelf(user)
+                    ? LocaleController.getString(R.string.SavedMessages)
+                    : ContactsController.formatName(user.first_name, user.last_name);
+        } else {
+            chat = mc.getChat(-dialogId);
+            if (chat == null) return null;
+            title = chat.title != null ? chat.title : "";
+        }
+        if (TextUtils.isEmpty(title)) title = " ";
+
+        ArrayList<MessageObject> top = mc.dialogMessage.get(dialogId);
+        MessageObject last = top == null || top.isEmpty() ? null : top.get(0);
+
+        StringBuilder meta = new StringBuilder();
+        if (dialog.unread_count > 0) {
+            meta.append(LocaleController.formatPluralString("NewMessages", dialog.unread_count));
+        } else if (last != null) {
+            meta.append(LocaleController.stringForMessageListDate(last.messageOwner.date));
+        }
+        Row.Builder row = new Row.Builder()
+                .setTitle(title)
+                .setBrowsable(true);
+        if (last != null) {
+            String preview = messagePreview(last, true);
+            if (meta.length() > 0) meta.append(" · ");
+            meta.append(preview);
+        }
+        if (meta.length() > 0) row.addText(shorten(meta.toString(), PREVIEW_MAX_CHARS));
+        IconCompat icon = avatarFor(user, chat);
+        if (icon != null) {
+            row.setImage(new CarIcon.Builder(icon).build(), Row.IMAGE_TYPE_LARGE);
+        }
+        final String screenTitle = title;
+        row.setOnClickListener(() -> getScreenManager().push(
+                new CarChatScreen(getCarContext(), this, currentAccount, dialogId, screenTitle)));
+        return row.build();
+    }
+
+    /**
+     * Short text for a message as the chat list shows it. With {@code withSender}, outgoing
+     * messages get "You:" and group messages the sender's name in front.
+     */
+    String messagePreview(MessageObject mo, boolean withSender) {
+        String[] senderName = new String[1];
+        boolean[] preview = new boolean[1];
+        String body;
+        try {
+            body = NotificationsController.getInstance(currentAccount)
+                    .getShortStringForMessage(mo, senderName, preview);
+        } catch (Throwable t) {
+            body = mo.messageText != null ? mo.messageText.toString() : "";
+        }
+        if (body == null) body = "";
+        if (!withSender) return body;
+        if (mo.isOut()) {
+            return LocaleController.getString(R.string.FromYou) + ": " + body;
+        }
+        if (senderName[0] != null && !DialogObject.isUserDialog(mo.getDialogId())) {
+            return senderName[0] + ": " + body;
+        }
+        return body;
+    }
+
+    /** List previews stay on about one line; "Read aloud" still gets the full text. */
+    static final int PREVIEW_MAX_CHARS = 60;
+
+    /**
+     * Collapses line breaks and runs of spaces, then cuts at a word boundary. Bot messages
+     * (Paperclip, Home Assistant) are often long and multi-line, which otherwise makes a
+     * single list entry fill the car screen.
+     */
+    static String shorten(String text, int maxChars) {
+        if (text == null) return "";
+        String flat = text.replaceAll("\\s+", " ").trim();
+        if (flat.length() <= maxChars) return flat;
+        int cut = flat.lastIndexOf(' ', maxChars);
+        if (cut < maxChars / 2) cut = maxChars;
+        return flat.substring(0, cut).trim() + "…";
+    }
+
+    int getCurrentAccount() {
+        return currentAccount;
+    }
+
+    int hostListLimit() {
+        try {
+            return getCarContext().getCarService(ConstraintManager.class)
+                    .getContentLimit(ConstraintManager.CONTENT_LIMIT_TYPE_LIST);
+        } catch (Throwable t) {
+            return MAX_CONVERSATIONS;
+        }
+    }
+
     // ===== Music tab =====
 
     private Template buildMusicTemplate() {
@@ -498,6 +676,56 @@ public class HomeScreen extends Screen
             fileLocation = chat.photo.photo_small;
         }
         return iconFromAvatar(fileLocation);
+    }
+
+    /** Telegram's avatar palette (red, orange, violet, green, cyan, blue, pink). */
+    private static final int[] AVATAR_COLORS = {
+            0xFFE56555, 0xFFF28C48, 0xFF8E85EE, 0xFF76C84D, 0xFF5FBED5, 0xFF549CDD, 0xFFF2749A
+    };
+
+    /**
+     * The letter avatar the chat list shows for chats without a photo. Drawn here rather
+     * than with AvatarDrawable, whose paints only exist once the chat list UI has been
+     * created -- which never happens when the car starts the process.
+     */
+    IconCompat placeholderAvatar(TLRPC.User user, TLRPC.Chat chat) {
+        try {
+            long id;
+            String name;
+            if (user != null) {
+                id = user.id;
+                name = ContactsController.formatName(user.first_name, user.last_name);
+            } else if (chat != null) {
+                id = chat.id;
+                name = chat.title;
+            } else {
+                return null;
+            }
+            String trimmed = name == null ? "" : name.trim();
+            String initial = trimmed.isEmpty() ? "?" : trimmed.substring(0, trimmed.offsetByCodePoints(0, 1)).toUpperCase();
+            int size = AndroidUtilities.dp(64);
+            Bitmap bitmap = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888);
+            Canvas canvas = new Canvas(bitmap);
+            Paint circle = new Paint(Paint.ANTI_ALIAS_FLAG);
+            circle.setColor(AVATAR_COLORS[(int) Math.abs(id % AVATAR_COLORS.length)]);
+            canvas.drawCircle(size / 2f, size / 2f, size / 2f, circle);
+            Paint text = new Paint(Paint.ANTI_ALIAS_FLAG);
+            text.setColor(Color.WHITE);
+            text.setTextSize(size * 0.45f);
+            text.setTextAlign(Paint.Align.CENTER);
+            text.setFakeBoldText(true);
+            float baseline = size / 2f - (text.descent() + text.ascent()) / 2f;
+            canvas.drawText(initial, size / 2f, baseline, text);
+            return IconCompat.createWithBitmap(bitmap);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    /** Photo if cached, otherwise the letter avatar. */
+    IconCompat avatarFor(TLRPC.User user, TLRPC.Chat chat) {
+        IconCompat icon = loadAvatarIcon(user, chat);
+        return icon != null ? icon : placeholderAvatar(user, chat);
     }
 
     private IconCompat loadUserAvatarIcon(TLRPC.User user) {
