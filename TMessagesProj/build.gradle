@@ -213,6 +213,10 @@ android {
                         return true
                     }
                 }
+                def appSignSha1 = (properties != null ? properties.getProperty("APP_SIGN_SHA1") : null) ?: System.getenv("APP_SIGN_SHA1")
+                if (appSignSha1 != null && !appSignSha1.isBlank()) {
+                    arguments += "-DAPP_SIGN_SHA1=" + appSignSha1.replace(":", "").toUpperCase()
+                }
                 targets 'tmessages.49'
             }
         }

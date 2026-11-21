@@ -3,7 +3,11 @@
 #include "read_cert.h"
 #include "SHA1.h"
 
-static const char *SIGN = "3A0F57FE06485D0B90D0ACD990E3A30328E3988D";
+// Override with -DAPP_SIGN_SHA1=... (see APP_SIGN_SHA1 in local.properties) for builds signed with another key.
+#ifndef APP_SIGN_SHA1
+#define APP_SIGN_SHA1 "3A0F57FE06485D0B90D0ACD990E3A30328E3988D"
+#endif
+static const char *SIGN = APP_SIGN_SHA1;
 
 extern "C" {
 int verifySign(JNIEnv *env) {
