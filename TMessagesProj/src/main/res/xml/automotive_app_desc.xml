@@ -2,5 +2,7 @@
 <automotiveApp>
     <uses name="notification"/>
     <uses name="template"/>
-    <uses name="media"/>
+    <!-- Deliberately no "media": with it, Android Auto in the car showed Nagram only as a
+         media player and never opened the templated app (Notifications / Pinned / Music
+         tabs). Music stays reachable through the Music tab. -->
 </automotiveApp>

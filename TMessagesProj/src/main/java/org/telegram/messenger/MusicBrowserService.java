@@ -43,6 +43,7 @@ public class MusicBrowserService extends MediaBrowserService {
     @Nullable
     @Override
     public BrowserRoot onGetRoot(String clientPackageName, int clientUid, Bundle rootHints) {
+        FileLog.d("CarApp: media browser root requested by " + clientPackageName);
         if (clientPackageName == null) {
             return null;
         }
